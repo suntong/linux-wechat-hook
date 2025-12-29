@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.5)
 
 FILE(GLOB_RECURSE INFECTOR_FILES ./*.cpp)
 #add_compile_options(-fPIC)

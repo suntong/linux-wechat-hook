@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.5)
 
 aux_source_directory(./threadpool/ BASE_FILES)
 aux_source_directory(./timer/ BASE_FILES)
