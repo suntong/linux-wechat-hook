@@ -26,7 +26,8 @@
 #============================================================================
 # wechat_hook - Main hook entry point
 #============================================================================
-.global wechat_hook
+.global wechat_hook          # Entry point (16 NOPs)
+.global wechat_hook_resume   # Exit point (30 NOPs)
 .type wechat_hook, @function
 
 wechat_hook:
@@ -156,6 +157,7 @@ wechat_hook:
     # r11 is caller-saved, so WeChat doesn't rely on its value
     # If needed, we could use a different strategy to preserve it exactly
 
+wechat_hook_resume:
     #========================================================================
     # EXIT NOP SLED (30 bytes)
     # This is second_nop_cmd_addr - init code patches this with:

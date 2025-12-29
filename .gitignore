@@ -3,3 +3,4 @@
 *.vscode*
 base_build
 build
+*~
