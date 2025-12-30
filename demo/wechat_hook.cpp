@@ -56,6 +56,16 @@ static inline bool is_valid_user_ptr(uint64_t addr) {
  */
 extern "C" void wechat_hook_core(struct hook_regs *regs) {
   /*
+   * UNCONDITIONAL DEBUG: Print to confirm we reached here
+   */
+  printf("[HOOK] wechat_hook_core called!\n");
+  printf("[HOOK] rdi=0x%lx rsi=0x%lx rax=0x%lx\n",
+         regs->rdi, regs->rsi, regs->rax);
+  printf("[HOOK] rsp=0x%lx rbp=0x%lx rflags=0x%lx\n",
+         regs->rsp, regs->rbp, regs->rflags);
+  fflush(stdout);  // Force immediate output
+
+  /*
    * Access register values - these are the EXACT values
    * that were in the CPU registers when WeChat hit the hook point
    */
@@ -298,7 +308,7 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
 
   size_t off = 0;
 
-  /* je +12 */
+  /* je +12 (skip movabs+call = 10+2 bytes) */
   exit_patch[off++] = 0x74;
   exit_patch[off++] = 0x0C;
 
@@ -311,17 +321,22 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
   exit_patch[off++] = 0xFF;
   exit_patch[off++] = 0xD0;
 
+  /* Normalize RAX so we don't resume with RAX == return address */
+  exit_patch[off++] = 0x31;  /* xor eax, eax */
+  exit_patch[off++] = 0xC0;
+
   /* cmpb 0x10(%rsp), $0x0 — copy original 5 bytes from orig+7 */
   memcpy(exit_patch + off, orig + 7, 5); off += 5;
 
-  /* movabs rax, return_addr */
-  exit_patch[off++] = 0x48;  /* REX.W */
-  exit_patch[off++] = 0xB8;  /* MOV RAX, imm64 */
+  /* movabs r11, return_addr */
+  exit_patch[off++] = 0x49;  /* REX.W + REX.B */
+  exit_patch[off++] = 0xBB;  /* MOV R11, imm64 */
   memcpy(exit_patch + off, &return_addr, 8); off += 8;
 
-  /* jmp rax */
+  /* jmp r11 */
+  exit_patch[off++] = 0x41;  /* REX.B */
   exit_patch[off++] = 0xFF;
-  exit_patch[off++] = 0xE0;
+  exit_patch[off++] = 0xE3;
 
   LOGGER_INFO << "Exit trampoline size: " << LogFormat::addr << off << " bytes";
 
@@ -345,6 +360,20 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
   /* jmp rax */
   hook_patch[10] = 0xFF;
   hook_patch[11] = 0xE0;
+
+  /* Debug: dump the patched bytes */
+  printf("[PATCH] Exit trampoline bytes:\n  ");
+  for (size_t i = 0; i < off; i++) {
+    printf("%02X ", exit_patch[i]);
+  }
+  printf("\n");
+
+  printf("[PATCH] Hook point bytes:\n  ");
+  for (int i = 0; i < 12; i++) {
+    printf("%02X ", hook_patch[i]);
+  }
+  printf("\n");
+  fflush(stdout);
 
   /* Restore memory protection */
   mprotect_page(wechat_hook_addr, 12, PROT_READ | PROT_EXEC);
