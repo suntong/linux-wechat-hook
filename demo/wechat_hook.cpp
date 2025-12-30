@@ -6,7 +6,6 @@
 #include <sys/mman.h>
 #include <elf.h>
 #include <errno.h>
-#include <link.h>  // for dl_iterate_phdr
 
 #include "hook.h"
 #include "target/targetopt.h"
@@ -18,25 +17,6 @@
 /* Import assembly labels directly */
 extern "C" void wechat_hook(void);
 extern "C" void wechat_hook_resume(void);
-
-/*
- * Get main executable base address via dl_iterate_phdr.
- * The main executable has an empty dlpi_name.
- * dlpi_addr is the load bias (base address for PIE).
- */
-static int phdr_cb(struct dl_phdr_info *info, size_t /*size*/, void *data) {
-  if (!info->dlpi_name || info->dlpi_name[0] == '\0') {
-    *(Elf64_Addr *)data = (Elf64_Addr)info->dlpi_addr;
-    return 1; // stop iteration
-  }
-  return 0; // continue
-}
-
-static Elf64_Addr get_main_exe_base() {
-  Elf64_Addr base = 0;
-  dl_iterate_phdr(phdr_cb, &base);
-  return base;
-}
 
 /*
  * Helper function to page-align an address and call mprotect
@@ -130,25 +110,36 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
 
   lmc::Logger::setLevel(LogLevel::all);
 
+  TargetMaps target(getpid());
+  Elf64_Addr wechat_baseaddr = 0;
+
   /* Get addresses directly from exported assembly labels */
   Elf64_Addr first_nop_cmd_addr = (Elf64_Addr)wechat_hook;
   Elf64_Addr second_nop_cmd_addr = (Elf64_Addr)wechat_hook_resume;
 
-  /* 
-   * Get main executable base address using dl_iterate_phdr.
-   * This is more reliable than scanning /proc/self/maps because:
-   * 1. It gives us the load bias directly (what we need for PIE)
-   * 2. It doesn't depend on which segment we happen to find first
-   * 3. It's the "official" way to get this information
-   */
-  Elf64_Addr wechat_baseaddr = get_main_exe_base();
-
-  if (!wechat_baseaddr) {
-    LOGGER_ERROR << "Failed to find WeChat base address via dl_iterate_phdr";
+  if (!target.readTargetAllMaps()) {
+    LOGGER_ERROR << "Failed to read target maps";
     return;
   }
 
-  LOGGER_INFO << "WeChat base (load bias): " << LogFormat::addr << wechat_baseaddr;
+  /* Find WeChat base address */
+  auto & maps = target.getMapInfo();
+  for (auto & m:maps) {
+    /* Check for wechat binary, but exclude .so files */
+    if (m.first.find("wechat") != std::string::npos &&
+        m.first.find(".so") == std::string::npos &&
+        wechat_baseaddr == 0) {
+      wechat_baseaddr = m.second;
+      LOGGER_INFO << m.first << " :: " << LogFormat::addr << m.second;
+    }
+  }
+
+  if (!wechat_baseaddr) {
+    LOGGER_ERROR << "Failed to find WeChat base address";
+    return;
+  }
+
+  LOGGER_INFO << "WeChat base: " << LogFormat::addr << wechat_baseaddr;
   LOGGER_INFO << "Hook target: " << LogFormat::addr << (wechat_baseaddr +
 							WECHAT_OFFSET);
   LOGGER_INFO << "Entry sled (wechat_hook): " << LogFormat::addr << first_nop_cmd_addr;
@@ -197,7 +188,7 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
    * just memcpy them - they would jump/call to wrong addresses.
    *
    * Solution: Rebuild with absolute addressing (31 bytes total):
-   *   74 0C             je +12 (skip movabs+call = 10+2 bytes)
+   *   74 0C             je +12 (skip the movabs+call = 10+2 bytes)
    *   48 B8 [8 bytes]   movabs rax, <absolute call target>
    *   FF D0             call rax
    *   80 7C 24 10 00    cmpb $0x0, 0x10(%rsp) (safe, no relocation)
@@ -223,9 +214,6 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
 
   /* movabs rax, imm64 (return address = hook point + N) */
   Elf64_Addr return_addr = wechat_baseaddr + WECHAT_OFFSET + 12; /* N = 12 here */
-
-  LOGGER_INFO << "Original call target (absolute): " << LogFormat::addr << call_abs;
-  LOGGER_INFO << "Return address: " << LogFormat::addr << return_addr;
 
   size_t off = 0;
 
@@ -254,7 +242,7 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
   exit_patch[off++] = 0xFF;
   exit_patch[off++] = 0xE0;
 
-  LOGGER_INFO << "Exit trampoline size: " << LogFormat::addr << off << " bytes";
+  LOGGER_INFO << "Exit trampoline size: " << off << " bytes";
 
   /*
    * =================================================================
