@@ -41,27 +41,25 @@ wechat_hook:
     .endr
 
     #========================================================================
-    # SAVE ORIGINAL RSP IMMEDIATELY
-    # Must do this FIRST before any stack operations
-    # Use r11 temporarily (caller-saved, will be saved to struct later)
-    #========================================================================
-    mov r11, rsp
-
-    #========================================================================
-    # HANDLE RED ZONE
+    # ALLOCATE STACK SPACE FIRST
+    # 
+    # CRITICAL: Use lea instead of sub!
+    # sub modifies flags (ZF, SF, CF, OF, etc.), but we need to preserve
+    # the original flags from WeChat for the exit trampoline's je instruction.
+    # lea does NOT modify flags.
+    #
+    # HANDLE RED ZONE + ALLOCATE REGISTER STRUCT
     # x86-64 SysV ABI: 128 bytes below RSP may contain WeChat's data
     # We must not corrupt this area
+    #
+    # We allocate space for:
+    #   - 128 bytes red zone (x86-64 SysV ABI)
+    #   - REG_STRUCT_SIZE bytes for our register struct
     #========================================================================
-    sub rsp, 128
+    lea rsp, [rsp - 128 - REG_STRUCT_SIZE]
 
     #========================================================================
-    # ALLOCATE REGISTER STRUCT ON STACK
-    # Equivalent to: struct hook_regs regs;
-    #========================================================================
-    sub rsp, REG_STRUCT_SIZE
-
-    #========================================================================
-    # SAVE ALL REGISTERS TO STRUCT
+    # SAVE ALL OTHER REGISTERS TO STRUCT
     # 
     # Stack layout after this:
     #   [rsp + 0]   = rax
@@ -76,17 +74,25 @@ wechat_hook:
     mov [rsp + REG_RSI], rsi
     mov [rsp + REG_RDI], rdi
     mov [rsp + REG_RBP], rbp
-    mov [rsp + REG_RSP], r11        # Original RSP (saved in r11 earlier)
+    # skip REG_RSP for now
     mov [rsp + REG_R8],  r8
     mov [rsp + REG_R9],  r9
     mov [rsp + REG_R10], r10
-    mov [rsp + REG_R11], r11        # r11 held original RSP, save it too
+    mov [rsp + REG_R11], r11
     mov [rsp + REG_R12], r12
     mov [rsp + REG_R13], r13
     mov [rsp + REG_R14], r14
     mov [rsp + REG_R15], r15
 
-    # Save RFLAGS (condition flags)
+    # Save original RSP (value before our allocation)
+    lea rax, [rsp + 128 + REG_STRUCT_SIZE]
+    mov [rsp + REG_RSP], rax
+
+    #========================================================================
+    # SAVE RFLAGS
+    # Now we save the ORIGINAL flags from WeChat, since we used lea
+    # (which doesn't modify flags) instead of sub.
+    #========================================================================
     pushfq
     pop rax
     mov [rsp + REG_RFLAGS], rax
@@ -140,22 +146,20 @@ wechat_hook:
     mov r8,  [rsp + REG_R8]
     mov r9,  [rsp + REG_R9]
     mov r10, [rsp + REG_R10]
-    # Skip r11 for now - we need it to restore RSP
+    # r11 restored below after we're done using rsp-relative addressing
     mov r12, [rsp + REG_R12]
     mov r13, [rsp + REG_R13]
     mov r14, [rsp + REG_R14]
     mov r15, [rsp + REG_R15]
 
     #========================================================================
-    # RESTORE ORIGINAL RSP
-    # This also deallocates our struct and red zone padding
+    # RESTORE R11 AND RSP
     # 
-    # Note: We use r11 as temporary, then restore it
+    # Order matters! Load r11 while we can still access the struct,
+    # then restore rsp (after which we can't access the struct anymore).
     #========================================================================
-    mov r11, [rsp + REG_R11]        # Load saved r11 value to r11
-    mov rsp, [rsp + REG_RSP]        # Restore original RSP
-    # r11 is caller-saved, so WeChat doesn't rely on its value
-    # If needed, we could use a different strategy to preserve it exactly
+    mov r11, [rsp + REG_R11]        # restore original r11 value
+    mov rsp, [rsp + REG_RSP]        # restore original RSP
 
 wechat_hook_resume:
     #========================================================================

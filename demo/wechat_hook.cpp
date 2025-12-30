@@ -122,14 +122,17 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
     return;
   }
 
-  /* Find WeChat base address */
+  /* 
+   * Find WeChat base address by scanning maps.
+   * CRITICAL: Take the LAST matching entry (no early exit).
+   * The WECHAT_OFFSET was calculated assuming this behavior.
+   * Exclude .so files to avoid matching paths like /path/wechat-beta/libX.so
+   */
   auto & maps = target.getMapInfo();
-  for (auto & m:maps) {
-    /* Check for wechat binary, but exclude .so files */
+  for (auto & m : maps) {
     if (m.first.find("wechat") != std::string::npos &&
-        m.first.find(".so") == std::string::npos &&
-        wechat_baseaddr == 0) {
-      wechat_baseaddr = m.second;
+        m.first.find(".so") == std::string::npos) {
+      wechat_baseaddr = m.second;  // OVERWRITES - always takes LAST match
       LOGGER_INFO << m.first << " :: " << LogFormat::addr << m.second;
     }
   }
@@ -177,6 +180,82 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
 
   /*
    * =================================================================
+   * RUNTIME ASSERTION: Verify hook site bytes before patching
+   * 
+   * Expected bytes at 0x9b0a7a (12 bytes):
+   *   [0-1]   74 05             je +5
+   *   [2]     e8                call rel32 opcode
+   *   [3-6]   XX XX XX XX       rel32 displacement
+   *   [7-11]  80 7c 24 10 00    cmpb $0x0, 0x10(%rsp)
+   * =================================================================
+   */
+  unsigned char *orig = (unsigned char *) wechat_baseaddr + WECHAT_OFFSET;
+  
+  /* Expected bytes for verification */
+  const unsigned char expected_je[2] = { 0x74, 0x05 };
+  const unsigned char expected_call_opcode = 0xE8;
+  const unsigned char expected_cmpb[5] = { 0x80, 0x7C, 0x24, 0x10, 0x00 };
+  
+  bool mismatch = false;
+
+  /* Check je +5 at orig[0..1] */
+  if (memcmp(orig, expected_je, 2) != 0) {
+    LOGGER_ERROR << "Assertion failed: je instruction mismatch at orig+0";
+    LOGGER_ERROR << "  Expected: 74 05";
+    LOGGER_ERROR << "  Got: " << LogFormat::addr << (unsigned int)orig[0] 
+                 << " " << LogFormat::addr << (unsigned int)orig[1];
+    mismatch = true;
+  }
+
+  /* Check call opcode at orig[2] */
+  if (orig[2] != expected_call_opcode) {
+    LOGGER_ERROR << "Assertion failed: call opcode mismatch at orig+2";
+    LOGGER_ERROR << "  Expected: E8";
+    LOGGER_ERROR << "  Got: " << LogFormat::addr << (unsigned int)orig[2];
+    mismatch = true;
+  }
+
+  /* Check cmpb at orig[7..11] */
+  if (memcmp(orig + 7, expected_cmpb, 5) != 0) {
+    LOGGER_ERROR << "Assertion failed: cmpb instruction mismatch at orig+7";
+    LOGGER_ERROR << "  Expected: 80 7C 24 10 00";
+    LOGGER_ERROR << "  Got: " 
+                 << LogFormat::addr << (unsigned int)orig[7] << " "
+                 << LogFormat::addr << (unsigned int)orig[8] << " "
+                 << LogFormat::addr << (unsigned int)orig[9] << " "
+                 << LogFormat::addr << (unsigned int)orig[10] << " "
+                 << LogFormat::addr << (unsigned int)orig[11];
+    mismatch = true;
+  }
+
+  if (mismatch) {
+    LOGGER_ERROR << "Hook site verification FAILED - aborting to prevent crash";
+    LOGGER_ERROR << "Full 12 bytes at hook site:";
+    LOGGER_ERROR << "  " 
+                 << LogFormat::addr << (unsigned int)orig[0] << " "
+                 << LogFormat::addr << (unsigned int)orig[1] << " "
+                 << LogFormat::addr << (unsigned int)orig[2] << " "
+                 << LogFormat::addr << (unsigned int)orig[3] << " "
+                 << LogFormat::addr << (unsigned int)orig[4] << " "
+                 << LogFormat::addr << (unsigned int)orig[5] << " "
+                 << LogFormat::addr << (unsigned int)orig[6] << " "
+                 << LogFormat::addr << (unsigned int)orig[7] << " "
+                 << LogFormat::addr << (unsigned int)orig[8] << " "
+                 << LogFormat::addr << (unsigned int)orig[9] << " "
+                 << LogFormat::addr << (unsigned int)orig[10] << " "
+                 << LogFormat::addr << (unsigned int)orig[11];
+    
+    /* Restore memory protection before aborting */
+    mprotect_page(wechat_hook_addr, 12, PROT_READ | PROT_EXEC);
+    mprotect_page(libx_first_addr, 64, PROT_READ | PROT_EXEC);
+    mprotect_page(libx_second_addr, 64, PROT_READ | PROT_EXEC);
+    return;
+  }
+
+  LOGGER_INFO << "Hook site verification PASSED";
+
+  /*
+   * =================================================================
    * PATCH 1: Exit trampoline (second_nop_cmd_addr)
    * 
    * Original code at 0x9b0a7a (12 bytes):
@@ -188,7 +267,7 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
    * just memcpy them - they would jump/call to wrong addresses.
    *
    * Solution: Rebuild with absolute addressing (31 bytes total):
-   *   74 0C             je +12 (skip the movabs+call = 10+2 bytes)
+   *   74 0C             je +12 (skip movabs+call = 10+2 bytes)
    *   48 B8 [8 bytes]   movabs rax, <absolute call target>
    *   FF D0             call rax
    *   80 7C 24 10 00    cmpb $0x0, 0x10(%rsp) (safe, no relocation)
@@ -204,7 +283,6 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
    * =================================================================
    */
   unsigned char *exit_patch = (unsigned char *) second_nop_cmd_addr;
-  unsigned char *orig = (unsigned char *) wechat_baseaddr + WECHAT_OFFSET;
 
   /* Compute absolute target of original call at orig+2 (e8 rel32) */
   int32_t rel32 = 0;
@@ -214,6 +292,9 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
 
   /* movabs rax, imm64 (return address = hook point + N) */
   Elf64_Addr return_addr = wechat_baseaddr + WECHAT_OFFSET + 12; /* N = 12 here */
+
+  LOGGER_INFO << "Original call target (absolute): " << LogFormat::addr << call_abs;
+  LOGGER_INFO << "Return address: " << LogFormat::addr << return_addr;
 
   size_t off = 0;
 
@@ -242,7 +323,7 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
   exit_patch[off++] = 0xFF;
   exit_patch[off++] = 0xE0;
 
-  LOGGER_INFO << "Exit trampoline size: " << off << " bytes";
+  LOGGER_INFO << "Exit trampoline size: " << LogFormat::addr << off << " bytes";
 
   /*
    * =================================================================
