@@ -59,15 +59,67 @@ void __attribute__((constructor)) wechat_hook_init(void) {
 
         if (mprotect((void *)(wechat_baseaddr), 0x1000000, PROT_WRITE | PROT_READ | PROT_EXEC) < 0)
         {
-            
+            LOGGER_INFO << "mprotect wechat (RWX) failed";
         }
 
         if (mprotect((void *)(libx_baseaddr), 0x10000, PROT_WRITE | PROT_READ | PROT_EXEC) < 0)
         {
-            
+            LOGGER_INFO << "mprotect libx (RWX) failed";
         }
         
-        memcpy((unsigned char *)second_nop_cmd_addr, (unsigned char *)wechat_baseaddr + WECHAT_OFFSET, 12);
+        // --- FIXED TRAMPOLINE: relocate je/call/cmpb correctly ---
+        //
+        // Original at WECHAT_OFFSET:
+        //   9b0a7a: 74 05                   je     9b0a81
+        //   9b0a7c: e8 3f e1 a4 ff          call   3febc0 <_ZdlPv@plt>
+        //   9b0a81: 80 7c 24 10 00          cmpb   $0x0,0x10(%rsp)
+        //
+        // We build at second_nop_cmd_addr:
+        //   jz  +0x0c                      ; skip movabs+call if ZF=1
+        //   movabs rax, call_target
+        //   call  rax
+        //   cmpb  $0x0,0x10(%rsp)
+        //   movabs rax, resume
+        //   jmp   rax
+        //
+        // NOTE: call is absolute (mov rax; call rax) to avoid rel32 range issues
+        // when calling from libX.so to wechat.
+
+        unsigned char *orig = (unsigned char *)wechat_baseaddr + WECHAT_OFFSET;
+        unsigned char *tramp = (unsigned char *)second_nop_cmd_addr;
+
+        unsigned char tramp_inst[32];
+        memset(tramp_inst, 0x90, sizeof(tramp_inst));
+        int t_idx = 0;
+
+        // 1) JZ +0x0c  (skip over movabs+call)
+        tramp_inst[t_idx++] = 0x74;  // JZ rel8
+        tramp_inst[t_idx++] = 0x0c;  // +12 bytes
+
+        // 2) Compute absolute call_target from original rel32
+        int orig_disp = 0;
+        memcpy(&orig_disp, orig + 3, 4);  // original disp32 at orig+3
+        Elf64_Addr orig_call_after = (Elf64_Addr)(orig + 2 + 5);
+        Elf64_Addr call_target = orig_call_after + (int64_t)orig_disp;
+
+        // 3) movabs rax, call_target
+        tramp_inst[t_idx++] = 0x48;
+        tramp_inst[t_idx++] = 0xb8;
+        memcpy(&tramp_inst[t_idx], &call_target, 8);
+        t_idx += 8;
+
+        // 4) call rax
+        tramp_inst[t_idx++] = 0xff;
+        tramp_inst[t_idx++] = 0xd0;
+
+        // 5) cmpb $0x0,0x10(%rsp)  (copy from orig+7, position-independent)
+        memcpy(&tramp_inst[t_idx], orig + 7, 5);
+        t_idx += 5;
+
+        // Write relocated instructions to second_nop_cmd_addr
+        memcpy(tramp, tramp_inst, t_idx);
+
+        // After these t_idx bytes, keep your original movabs/jmp back.
 
         unsigned char movabs_wechat_buffer[10];
         memset(movabs_wechat_buffer, 0, sizeof(movabs_wechat_buffer));
@@ -75,13 +127,15 @@ void __attribute__((constructor)) wechat_hook_init(void) {
         movabs_wechat_buffer[0] = 0x48;
         movabs_wechat_buffer[1] = 0xb8;
         memcpy(&movabs_wechat_buffer[2], &wechat_hook_point_addr, 8);
-        memcpy((unsigned char *)second_nop_cmd_addr + 12, movabs_wechat_buffer, 10);
+
+        memcpy((unsigned char *)second_nop_cmd_addr + t_idx, movabs_wechat_buffer, 10);
 
         unsigned char jmp_wechat_buffer[2];
         jmp_wechat_buffer[0] = 0xff;
         jmp_wechat_buffer[1] = 0xe0;
-        memcpy((unsigned char *)second_nop_cmd_addr + 22, jmp_wechat_buffer, 2);
+        memcpy((unsigned char *)second_nop_cmd_addr + t_idx + 10, jmp_wechat_buffer, 2);
 
+        // --- HOOK INSTALLATION (unchanged) ---
         unsigned char movabs_buffer[10];
         memset(movabs_buffer, 0, sizeof(movabs_buffer));
         movabs_buffer[0] = 0x48;
@@ -96,12 +150,12 @@ void __attribute__((constructor)) wechat_hook_init(void) {
 
         if (mprotect((void *)(wechat_baseaddr), 0x1000000, PROT_READ | PROT_EXEC) < 0)
         {
-            
+            LOGGER_INFO << "mprotect wechat (RX) failed";
         }
 
         if (mprotect((void *)(libx_baseaddr), 0x10000, PROT_READ | PROT_EXEC) < 0)
         {
-            
+            LOGGER_INFO << "mprotect libx (RX) failed";
         }
     }
 }
@@ -230,7 +284,9 @@ static void wechat_hook_run()
           "m"(regs.rsi), "m"(regs.rdi), "m"(regs.r8), 
           "m"(regs.r9), "m"(regs.r10), "m"(regs.r11),
           "m"(regs.r12), "m"(regs.r13), "m"(regs.r14), "m"(regs.r15)
-        : "memory"
+        : "memory", "cc",
+          "rax","rbx","rcx","rdx","rsi","rdi",
+          "r8","r9","r10","r11","r12","r13","r14","r15"
     );
 }
 
@@ -254,11 +310,15 @@ void wechat_hook()
         "nop;\n"
         "mov %rbp,%r14;\n"
         "mov %rdi,%r15;\n"
+        "pushfq;\n"        // save flags from cmp %r12,%rdi
+        "sub $8, %rsp;\n"  // keep stack 16-byte aligned for call (if desired)
     );
    
    // printf("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     wechat_hook_run();
-    asm("nop;\n"
+    asm("add $8, %rsp;\n"  // undo alignment adjustment (if used)
+        "popfq;\n"         // restore flags before executing relocated je/call/cmpb
+        "nop;\n"
         "nop;\n"
         "nop;\n"
         "nop;\n"
